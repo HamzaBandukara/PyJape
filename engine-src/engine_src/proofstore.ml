@@ -1,0 +1,306 @@
+(*
+    Copyright (C) 2003-23 Richard Bornat & Bernard Sufrin
+     
+        richard@bornat.me.uk
+        sufrin@comlab.ox.ac.uk
+
+    This file is part of the jape proof engine, which is part of jape.
+
+    Jape is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    Jape is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with jape; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+    (or look at http://www.gnu.org).
+
+*)
+
+open Cxtfuns
+open Forcedef
+open Listfuns
+open Mappingfuns
+open Menu
+open Miscellaneous
+open Name
+open Optionfuns
+open Panelkind
+open Paraparam
+open Proofstage
+open Prooftree.Tree
+open Prooftree.Tree.Fmttree
+open Proviso
+open Rewrite
+open Sml
+open Thing
+
+type seq = Sequent.seq
+
+let freezesaved, thawsaved, clearproofs, proofnamed, proof_depends,
+    proof_children, addproof, saved, proofnames, provedthings, saveable,
+    proved, disproved, provedordisproved, inproofstore, saveproof,
+    saveproofs, proofs_which_use, is_proofnamed, discard_proofs =
+
+  let proofs : (name, (bool * prooftree * name list * bool * (seq * model) option)) mapping ref =
+    ref empty
+
+  and allsaved = ref true
+
+  and frozensaved = ref true in
+
+  let rec freezesaved () = frozensaved := !allsaved
+
+  and thawsaved () = allsaved := !frozensaved
+
+  and clearproofs () = proofs := empty; allsaved := true
+
+  and proofnamed name =
+    match thinginfo name, (!proofs <@> name) with
+    | Some (Theorem (_, provisos, seq), _)          , Some (v, tree, _, disproved, disproof) ->
+        Some (v, tree, provisos, [], disproved, disproof)
+    | Some (Rule ((_, provisos, givens, seq), _), _), Some (v, tree, _, disproved, disproof) ->
+        Some (v, tree, provisos, givens, disproved, disproof)
+    | _ -> None
+
+  and proof_depends name =
+    match (!proofs <@> name) with
+    | Some (_, _, children, _, _) -> Some children
+    | _ -> None
+
+  and proof_children name =
+    match proof_depends name with
+    | Some ns -> ns
+    | None -> []
+  
+  and proofs_which_use name =
+     fst <* ((fun (pname, (_, _, children, _, _)) -> List.mem name children) 
+          <| Mappingfuns.aslist !proofs)
+  
+  and is_proofnamed name =
+    match !proofs <@> name with
+    | Some (v,tree,_,_,disproof) -> subtrees tree <> [], bool_of_opt disproof
+    | None                       -> false, false
+  
+  and discard_proofs names = proofs := !proofs -- names
+  
+  (* when we prove something, we may prove a different sequent from the one that was 
+   * proposed, and a different set of provisos.  We shall check, and update the 
+   * statement of the theorem.  This has implications for conjectures that have 
+   * already been used in an earlier proof, of course, and it also has implications 
+   * for self-named conjectures - if the theorem sequent changes, then so should the 
+   * name of the theorem ... But I don't know how to do that properly.
+   *)
+  (* First step: don't allow circular proofs.  
+   * Future step:  check when a proof changes the meaning of a theorem
+         -- which is done now (see Thing.check_addthing)
+   * RB 8/x/96 
+   *)
+  (* and I REALLY REALLY MUST extend this to redefinition of Rules ... *)
+
+  and addproof checked_addthing alert query name proved proof givens cxt disproved disproofopt =
+    let cxt = rewritecxt cxt in
+    let seq = rewriteseq cxt (sequent proof) in
+    let provisos = provisos cxt in
+    let ds = depends proof in
+    let rec children n = if n = name then ds else proof_children n in
+    (* don't bother with Rule/Theorem distinction: proof_depends is just as quick *)
+    (* does derived rules stuff matter here? *)
+    let rec putitin name thing givens place =
+      checked_addthing (name, thing, place); (* addthing gets thing with only visible provisos *)
+      proofs :=
+        (!proofs ++ (name |-> (proved, proof, ds, disproved, disproofopt)));
+      allsaved := false;
+      true
+    in
+    (* this strips out invisible provisos before storing a proof. This confuses
+       Thing.check_addthing, because CookedRule and CookedTheorem contain invisible
+       provisos. So those must be stripped out before checking if a proof actually
+       matches the stored thing to be proved. Oh dear. RB 07/10/2023
+     *)
+    let rec doit () =
+      match givens, thingnamed name with
+      | [], Some (Theorem (params, _, _), place) ->
+          putitin name (Theorem (params, storableprovisos provisos, seq)) []
+            place
+      | _ :: _, Some (Theorem (params, _, _), place) ->
+          alert
+            ["replacing theorem "; parseablestring_of_name name;
+             " with derived rule"];
+          putitin name
+            (Rule ((params, storableprovisos provisos, givens, seq), false))
+            givens place
+      | _, Some (Rule ((params, _, _, _), _), place) ->
+          putitin name
+            (Rule ((params, storableprovisos provisos, givens, seq), false))
+            givens place
+      | _ ->
+          raise
+            (Catastrophe_ ["can't find theorem statement in addproof"])
+    in
+    if not proved then doit ()
+    else
+      (* if it's not proved we don't really care ... *)
+      match toposort [name] children with
+      | _, [] -> doit ()
+      | _, cycles ->
+          (* no cycles *)
+          alert
+            ["can't add proof of "; parseablestring_of_name name;
+             " because it introduces circularity: ";
+             string_of_list
+               (fun bs -> string_of_list parseablestring_of_name " uses " bs)
+               "; and " cycles];
+          false
+
+  and saved () = !allsaved
+
+  and proofnames () = dom !proofs in
+  (* dom now gives them in insertion order, I believe *)
+
+  let provedthings = proofnames in
+
+  let rec saveable () = not (isempty !proofs)
+
+  and proved n =
+    match proofnamed n with
+    | Some (proved,_, _, _, _,_) -> proved
+    | _                          -> false
+
+  and disproved n =
+    match proofnamed n with
+    | Some (_, _, _, _,disproved,_) -> disproved
+    | _                             -> false
+
+  and provedordisproved n =
+    match proofnamed n with
+    | Some (proved, _, _, _,disproved,_) -> Some (proved,disproved)
+    | _                                  -> None
+  in
+
+  let inproofstore = bool_of_opt <.> proofnamed in
+
+  let word_of_menu _ = "MENU" in
+
+  let word_of_panel p =
+    match getpanelkind p with
+    | Some TacticPanelkind     -> "TACTICPANEL"
+    | Some ConjecturePanelkind -> "CONJECTUREPANEL"
+    | Some GivenPanelkind      -> 
+        raise (Catastrophe_ ["proof in GIVENPANEL"])
+    | None -> 
+       raise (Catastrophe_ ["proof in unknown panel "; string_of_name p])
+  in
+
+  (* this now takes provisos from the stored thing *)
+  (* I think it ought to take the statement of the theorem/rule from the same place,
+     but I've left it because it seems to work, provided there are no unknowns lurking
+     anywhere. And if there are ... oh dear.
+   *)
+  let rec saveproof chan name stage tree givens disproof =
+    let rec badthing () =
+      raise (Catastrophe_ ["No stored conjecture/derived rule called ";
+                           parseablestring_of_name name])
+    in
+    let place =
+      match thingnamed name with
+      | Some (th, place) ->
+          (match th with
+           | Theorem _       -> place
+           | Rule (_, false) -> place
+           | _               -> badthing ()
+          )
+      | _ -> badthing ()
+    in
+    let rec doit ss =
+      let provisos, params =
+        match thingnamed name with
+        | Some (Theorem (params, provisos, _), _)       -> (snd <* provisos), params
+        | Some (Rule ((params, provisos, _, _), _), _)  -> (snd <* provisos), params
+        | _                                             -> [],[]
+      in
+      let body =
+        catelim_prooftree2tactic tree provisos givens
+                                 (catelim_string_of_model disproof ss)
+      in
+      word_of_proofstage stage :: " " :: parseablestring_of_name name ::
+        (if null params then body
+         else
+           "\n(" ::
+             catelim_string_of_list catelim_string_of_paraparam ", " params
+               (")" :: body))
+    in
+    List.iter (output_string chan)
+      (match place with
+       | InMenu m ->
+           word_of_menu m :: " " :: parseablestring_of_name m :: "\n" ::
+             doit ["END\n"]
+       | InPanel p ->
+           word_of_panel p :: " " :: parseablestring_of_name p :: "\n" ::
+             doit ["END\n"]
+       | InLimbo -> doit [])
+
+  and saveproofs chan =
+    let show n =
+      match proofnamed n with
+      | Some (proved, tree, _, givens, disproved, disproof) ->
+          saveproof chan n Complete tree givens disproof
+      | _ -> ()
+    in
+    let names = (bool_of_opt <.> proofnamed) <| thingnames () in
+    let (sortednames, _) = toposort names (fun n -> proved <| proof_children n)
+    in
+    (* I thought of doing this -- record the values of applyconjecture 
+       in the proof file. But it's not a good idea. The old idea of turning
+       applyconjectures true when reloading a proof is the right thing.
+       output_string chan "INITIALISE applyconjectures "; 
+       output_string chan !applyconjectures;
+       output_string chan "\n\n";
+     *)
+    revapp show sortednames; allsaved := true
+    
+  in
+  freezesaved, thawsaved, clearproofs, proofnamed, proof_depends,
+  proof_children, addproof, saved, proofnames, provedthings, saveable,
+  proved, disproved, provedordisproved, inproofstore, saveproof,
+  saveproofs, proofs_which_use, is_proofnamed, discard_proofs
+
+let rec thingswithproofs triv =
+     (fun n ->
+        match thingnamed n with
+        | None -> false
+        | Some (Tactic _, _) -> false
+        | Some (Macro _, _) -> false
+        | Some (Rule (_, ax), _) -> not ax && (triv || proved n)
+        | Some (Theorem _, _) -> triv || proved n) <|
+     thingnames ()
+(* why is this different from thingswithproofs??? *)
+
+
+let rec namedthingswithproofs triv ts =
+    (fun n ->
+        match thingnamed n with
+        | None -> false
+        | Some (Tactic _, _) -> true
+        | Some (Macro _, _) -> true
+        | Some (Rule (_, ax), _) -> (ax || triv) || proved n
+        | Some (Theorem _, _) -> triv || proved n) <|
+     ts
+
+let thmLacksProof = not <.> proved
+
+let rec needsProof a1 a2 =
+  match a1, a2 with
+  | name, Rule (_, ax) -> not (ax || proved name)
+  | name, Tactic _     -> false
+  | name, Macro _      -> false
+  | name, Theorem _    -> not (proved name)
+
+let lacksProof name =
+  needsProof name (fst (_The (thingnamed name)))

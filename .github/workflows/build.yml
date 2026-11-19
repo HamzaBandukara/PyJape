@@ -1,0 +1,98 @@
+name: Build distributables
+
+# Builds PyJape (native OCaml engine + Python/Tkinter app) on every target
+# OS/arch, packages it with PyInstaller, and uploads a ready-to-run folder plus
+# an installer. Native code can't cross-compile, so each OS builds itself.
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  push:
+    tags: ['v*']            # …or on a version tag
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64 }
+          - { os: macos-latest,   name: macos-arm64 }   # Apple Silicon (current standard arm64 runner)
+          - { os: macos-15-intel, name: macos-x64 }     # Intel (macos-13 was retired Dec 2025); also runs on Apple Silicon via Rosetta
+          - { os: ubuntu-22.04,   name: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- native OCaml engine (needs OCaml 4.14) ---
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14"
+      - name: Install dune
+        run: opam install -y dune
+
+      # --- Python + PyInstaller ---
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Linux tk
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      # --- build engine + package (dune is on PATH via setup-ocaml's env) ---
+      - name: Build distributable
+        run: opam exec -- python build/make_dist.py
+
+      # --- installers ---
+      - name: Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\installer\jape.iss
+      - name: macOS dmg
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p build/dmg
+          cp -R "build/dist/PyJape.app" build/dmg/
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "PyJape" -srcfolder build/dmg \
+            -ov -format UDZO "build/PyJape-${{ matrix.name }}.dmg"
+      - name: Linux tarball
+        if: runner.os == 'Linux'
+        run: tar -C build/dist -czf build/PyJape-${{ matrix.name }}.tar.gz PyJape
+
+      - name: Upload app folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: PyJape-${{ matrix.name }}-folder
+          path: build/dist
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PyJape-${{ matrix.name }}-installer
+          path: |
+            build/*.dmg
+            build/*.tar.gz
+            build/installer/Output/*.exe
+          if-no-files-found: ignore
+
+  # On a v* tag, collect every OS's installer into a DRAFT GitHub Release.
+  # Review it on the Releases page, add notes, then publish it by hand.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PyJape-*-installer
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: release/**/*

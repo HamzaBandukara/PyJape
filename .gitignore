@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+# OCaml build
+engine-src/_build/
+# Built native engine (produced by build/make_dist.py per-OS)
+resources/jape-engine
+resources/jape-engine.exe
+# PyInstaller / installer outputs
+build/dist/
+build/work/
+build/installer/Output/
+build/*.dmg
+build/*.tar.gz
+# Stray save files in the repo root (examples/ ships real .jp files, so not *.jp)
+/*.jp
