@@ -23,6 +23,8 @@ Java interface with a simpler one built for teaching:
   for propositional goals.
 - **Undo, redo and restart**, plus automatic saving of your own exercises and
   proofs between sessions.
+- **Adjustable text size** (Ctrl+= and Ctrl+-), handy on small screens and
+  projectors.
 - **Countermodels (experimental).** Show that a sequent *can't* be proved by
   building a Kripke model in which its premises hold and its conclusion
   doesn't.
@@ -87,6 +89,21 @@ you so. Nothing about the proof changes. When every step is justified, it
 shows **✓ complete**. The **About** button on the toolbar shows PyJape's
 credits and licence notice.
 
+### Text size
+
+If the text is too small or too large, for example on a projector, change it
+from the **View** menu or with the keyboard:
+
+| | Windows / Linux | macOS |
+|---|---|---|
+| Bigger text | Ctrl+= | Cmd+= (or Ctrl+=) |
+| Smaller text | Ctrl+- | Cmd+- (or Ctrl+-) |
+| Normal size | Ctrl+0 | Cmd+0 (or Ctrl+0) |
+
+The size goes from 70% to 250% in steps of 10%, and the status bar shows the
+current size. Everything resizes straight away, including the proof and the
+countermodel. PyJape remembers your choice next time you open it.
+
 ### Finding a countermodel (experimental)
 
 > This feature is new and hasn't been fully tested yet. Expect rough edges,
@@ -143,6 +160,8 @@ PyJape, and they come back the next time you open it. They are stored in:
 **Save** writes to that file straight away. **Save as…** writes a copy anywhere
 you like, for example to hand in or back up. **Open…** loads a `.jp` file and
 adds its exercises and proofs. The files use Jape's own `.jp` proof format.
+
+Your text-size setting is kept in `settings.json` in the same folder.
 
 ## Build and run from source
 

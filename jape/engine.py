@@ -49,6 +49,8 @@ class Engine:
         self._ask_buttons = []       # labels from ASKSTART/ASKBUTTON, for the next ASKNOW
         self.alive = True
         self.save_path = None        # answered to WRITEFILENAME while saving
+        self.font_names = None       # optional callable -> 6 font names (see FONTNAMES)
+        self.stale = set()           # windows to redraw on next focus (fonts changed meanwhile)
 
     # --- lifecycle --------------------------------------------------------
     def start(self):
@@ -144,7 +146,10 @@ class Engine:
         if head == 'PANEGEOMETRY':
             self._write('0 0 800 600'); return True
         if head == 'FONTNAMES':
-            self._write('\u0091'.join(['Courier'] * 6)); return True
+            # The engine caches string widths (and formula folding) by font NAME, so
+            # each font needs its own name, and a new name whenever its size changes.
+            names = self.font_names() if self.font_names else ['PyJapeFont%d' % i for i in range(6)]
+            self._write('\u0091'.join(names)); return True
         if head == 'ASKSTART':
             self._ask_buttons = []; return True
         if head == 'ASKBUTTON':
@@ -216,11 +221,28 @@ class Engine:
         self.pump()
 
     def focus(self, num):
-        """Switch the engine's focus to proof window `num`. The engine emits no
-        redraw (it assumes the GUI cached the window), so we record a synthetic
-        marker; the parser then routes any later draws for `num` to it."""
-        self.command('COMMAND setfocus ' + str(num))
-        self.lines.append('__FOCUS__ ' + str(num))
+        """Switch the engine's focus to proof window `num`. We record a synthetic
+        marker FIRST, so the parser routes draws for `num` to it, including any
+        the engine sends in reply. Usually it sends none (it assumes the GUI cached
+        the window); if the fonts changed since `num` was last shown, we ask it to
+        redraw."""
+        num = str(num)
+        self.lines.append('__FOCUS__ ' + num)
+        self.command('COMMAND setfocus ' + num)
+        if num in self.stale:
+            self.stale.discard(num)
+            self.command('COMMAND refreshdisplay')
+
+    def fonts_changed(self, current=None):
+        """The GUI's fonts changed size. The engine re-lays out the focused proof
+        now (fonts_reset makes it re-ask FONTNAMES, so its width caches miss);
+        other open windows are redrawn when next focused. (The engine can redraw
+        background windows, but without saying which window it is drawing, so
+        we can't use those drawings.)"""
+        if not (self.booted and self.alive):
+            return
+        self.command('COMMAND fonts_reset')
+        self.stale = set(protocol.open_windows(self.lines).values()) - {str(current)}
 
     def state(self, focus=None):
         return protocol.parse_transcript('\n'.join(self.lines), focus=focus)

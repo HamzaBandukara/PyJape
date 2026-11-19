@@ -6,6 +6,7 @@ turns are fast, so we drive it synchronously on the main thread. Only the
 one-off startup (loading the theory) is slow, and we run that just after the
 window appears.
 """
+import json
 import os
 import re
 import tkinter as tk
@@ -66,6 +67,73 @@ PAL = {
 # display its copyright and no-warranty notice; the original Jape does this in a
 # Java About box, so PyJape carries the same notice. The three legal paragraphs
 # are kept word for word.
+# ---- text size -------------------------------------------------------------
+# Every font is a named tkfont.Font sized from ONE base, so zooming is a
+# configure() per font and every widget using it follows live. Sizes are in
+# points; the proof's fonts are measured for the engine, which re-lays out the
+# proof when they change (see Engine.fonts_changed).
+BASE_PT = 10
+TEXT_SCALE = {
+    'proof': 1.8,       # formulas in the proof (engine font 0)
+    'reason': 1.1,      # line numbers, rule names (engine font 1)
+    'reason_i': 1.1,    # provisos (engine font 2)
+    'ui': 1.1,          # status line
+    'term': 1.3,        # formulas outside the proof: entry, exercise list, tiles, labels
+    'brand': 1.3,       # the "PyJape" wordmark
+    'title': 1.6,       # About heading
+    'body': 1.0,        # ordinary interface text and buttons
+    'heading': 1.0,     # bold section headings
+    'small': 0.9,       # hints and tags
+    'small_bold': 0.9,
+    'mono': 1.0,        # the \escape table
+}
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.7, 2.5, 0.1
+MAC_TEXT = 1.3          # Tk on a Mac counts 1pt = 1 logical px (72 dpi), elsewhere ~96 dpi
+SETTINGS_FILE = os.path.join(SAVE_DIR, 'settings.json')
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding='utf-8') as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(d):
+    try:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        tmp = SETTINGS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(d, fh, indent=1)
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError:
+        pass
+
+
+def _enable_dpi_awareness():
+    """Windows: ask to draw at the screen's real resolution. Otherwise, at
+    125%/150% display scaling Windows stretches the window as a bitmap and all
+    text is blurry. Must run before tk.Tk(); then `tk scaling` reports the real
+    DPI and sizes in points come out right."""
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+    except ImportError:
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)      # Windows 8.1+: system-DPI aware
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()            # Vista/7 fallback
+    except Exception:
+        pass
+
+
 ABOUT_TEXT = """PyJape — a desktop front-end for the Jape proof calculator.
 https://github.com/HamzaBandukara/PyJape
 
@@ -85,7 +153,19 @@ class JapeApp:
     def __init__(self, root, engine_path, entry):
         self.root = root
         root.title('PyJape')
-        root.geometry('1100x760')
+        self.aqua = root.tk.call('tk', 'windowingsystem') == 'aqua'
+        # Screen pixels per layout pixel (layouts are designed at 96 dpi). With DPI
+        # awareness, Windows/Linux report the real DPI in `tk scaling` (px per pt);
+        # a Mac's Tk already works in logical pixels.
+        self.dpi = 1.0 if self.aqua else max(1.0, float(root.tk.call('tk', 'scaling')) / (96 / 72))
+        self.settings = _load_settings()
+        try:
+            z = float(self.settings.get('text_zoom', 1.0))
+        except (TypeError, ValueError):
+            z = 1.0
+        self.zoom = round(min(ZOOM_MAX, max(ZOOM_MIN, z)), 2)
+        self._init_w = min(self.px(1100), int(root.winfo_screenwidth() * 0.95))
+        root.geometry('%dx%d' % (self._init_w, min(self.px(760), int(root.winfo_screenheight() * 0.9))))
         root.configure(bg=PAL['bg'])
 
         # Prefer a normal-metric serif that still carries the logic symbols
@@ -93,15 +173,18 @@ class JapeApp:
         serif = self._pick_family(['Cambria', 'STIX Two Text', 'STIXGeneral',
                                    'DejaVu Serif', 'Georgia', 'Times New Roman', 'Times'])
         sans = self._pick_family(['Segoe UI', 'Helvetica', 'DejaVu Sans', 'Arial'])
-        self.fonts = {
-            0: tkfont.Font(family=serif, size=18),
-            1: tkfont.Font(family=sans, size=11),
-            2: tkfont.Font(family=sans, size=11, slant='italic'),
-        }
-        self.ui_font = tkfont.Font(family=sans, size=11)
-        self.term_small = tkfont.Font(family=serif, size=13)
+        mono = self._pick_family(['Consolas', 'Menlo', 'DejaVu Sans Mono', 'Courier New', 'Courier'])
+        fam = {'proof': serif, 'term': serif, 'mono': mono}
+        style = {'reason_i': {'slant': 'italic'}, 'brand': {'weight': 'bold'}, 'title': {'weight': 'bold'},
+                 'heading': {'weight': 'bold'}, 'small_bold': {'weight': 'bold'}}
+        self.f = {k: tkfont.Font(family=fam.get(k, sans), **style.get(k, {})) for k in TEXT_SCALE}
+        self.fonts = {0: self.f['proof'], 1: self.f['reason'], 2: self.f['reason_i']}   # the engine's fonts
+        self.ui_font = self.f['ui']
+        self.term_small = self.f['term']
+        self._apply_text_size()
 
         self.eng = E.Engine(engine_path, entry, measure=self._measure, font_info=self._font_info)
+        self.eng.font_names = self._engine_font_names
         self.eng.on_alert = self._alert
         self.eng.on_ask = self._ask
         self.state = P.State()
@@ -148,18 +231,98 @@ class JapeApp:
         """Real metrics of the font we actually draw with, so the engine spaces
         lines to match the glyphs (a small leading keeps lines from touching)."""
         f = self.fonts.get(fontnum, self.fonts[0])
-        return (f.metrics('ascent'), f.metrics('descent'), 2)
+        return (f.metrics('ascent'), f.metrics('descent'), max(2, self.zpx(2)))
+
+    def _engine_font_names(self):
+        """Names for the engine's fonts that change with their size, so its
+        width caches never mix up two fonts or two sizes."""
+        names = ['%s-%s-%d' % (self.fonts[i].actual('family'), self.fonts[i].actual('size'), i)
+                 for i in range(3)]
+        return [n.replace(' ', '_') for n in names] + ['PyJapeFont%d' % i for i in range(3, 6)]
+
+    # ---- text size -------------------------------------------------------
+    def px(self, n):
+        """A layout length in screen pixels (follows the display's DPI)."""
+        return int(round(n * self.dpi))
+
+    def zpx(self, n):
+        """A length that should grow with the text, like a wrap width."""
+        return int(round(n * self.dpi * self.zoom))
+
+    def _apply_text_size(self):
+        k = self.zoom * (MAC_TEXT if self.aqua else 1.0)
+        for name, font in self.f.items():
+            font.configure(size=max(6, round(BASE_PT * TEXT_SCALE[name] * k)))
+        # widgets without an explicit font (toolbar buttons, menus) follow too
+        for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont'):
+            try:
+                tkfont.nametofont(name, root=self.root).configure(size=max(6, round(BASE_PT * k)))
+            except tk.TclError:
+                pass
+
+    def _key(self, k):
+        return ('Cmd+' if self.aqua else 'Ctrl+') + k
+
+    def set_zoom(self, z):
+        z = round(min(ZOOM_MAX, max(ZOOM_MIN, z)), 2)
+        if z != self.zoom:
+            self.zoom = z
+            self._apply_text_size()
+            self.side.configure(width=self._side_width())
+            try:
+                self.eng.fonts_changed(self.cur_num)     # the engine re-lays out the proof
+            except Exception as e:
+                self._set_status(str(e), 'error'); return
+            self.refresh()
+            self.settings['text_zoom'] = z
+            _save_settings(self.settings)
+        self._set_status('Text size %d%%   (%s bigger, %s smaller, %s normal)'
+                         % (round(z * 100), self._key('='), self._key('−'), self._key('0')))
+
+    def zoom_by(self, steps):
+        self.set_zoom(round(self.zoom / ZOOM_STEP + steps) * ZOOM_STEP)
+
+    def _bind_keys(self):
+        """Undo/redo and text size. Ctrl everywhere; Cmd as well on a Mac only:
+        on Windows, Tk reports Num Lock as the same modifier as Command (Mod1),
+        so a <Command-…> binding there fires on the plain key with Num Lock on."""
+        mods = ['Control'] + (['Command'] if self.aqua else [])
+        acts = [(('z',), self.undo), (('Z',), self.redo),
+                (('equal', 'plus', 'KP_Add'), lambda: self.zoom_by(+1)),
+                (('minus', 'underscore', 'KP_Subtract'), lambda: self.zoom_by(-1)),
+                (('0', 'KP_0', 'KP_Insert'), lambda: self.set_zoom(1.0))]
+        for m in mods:
+            for keys, fn in acts:
+                for k in keys:
+                    # <Control-Key-0>, not <Control-0>: a bare digit means a mouse button
+                    self.root.bind_all('<%s-Key-%s>' % (m, k), lambda e, fn=fn: (fn(), 'break')[1])
+
+    def _side_width(self):
+        win = self.root.winfo_width()
+        win = win if win > 1 else self._init_w
+        return max(self.px(300), min(self.zpx(360), int(win * 0.45)))
+
+    def _wrap(self):
+        """Wrap width for text in the sidebar."""
+        return self._side_width() - self.px(30)
 
     # ---- layout ----------------------------------------------------------
     def _build_ui(self):
         self.menubar = tk.Frame(self.root, bg=PAL['bg'])
         self.menubar.pack(side='top', fill='x')
-        tk.Label(self.menubar, text='PyJape', font=('Helvetica', 13, 'bold'),
+        tk.Label(self.menubar, text='PyJape', font=self.f['brand'],
                  bg=PAL['bg'], fg=PAL['ink']).pack(side='left', padx=(10, 4), pady=6)
         self.title_lbl = tk.Label(self.menubar, text='', font=self.term_small, bg=PAL['bg'], fg=PAL['muted'])
         self.title_lbl.pack(side='right', padx=10)
         self.menu_holder = tk.Frame(self.menubar, bg=PAL['bg'])
         self.menu_holder.pack(side='left')
+        view = tk.Menubutton(self.menubar, text='View', relief='flat', bg=PAL['bg'], fg=PAL['ink'])
+        vm = tk.Menu(view, tearoff=0)
+        vm.add_command(label='Bigger text', accelerator=self._key('='), command=lambda: self.zoom_by(+1))
+        vm.add_command(label='Smaller text', accelerator=self._key('−'), command=lambda: self.zoom_by(-1))
+        vm.add_command(label='Normal text size', accelerator=self._key('0'), command=lambda: self.set_zoom(1.0))
+        view.configure(menu=vm)
+        view.pack(side='left', padx=2)
         tk.Button(self.menubar, text='↩ Undo', command=self.undo, relief='flat',
                   bg=PAL['bg'], fg=PAL['ink'], highlightbackground=PAL['bg']).pack(side='left', padx=6)
         tk.Button(self.menubar, text='↺ Restart proof', command=self.restart_proof, relief='flat',
@@ -184,17 +347,17 @@ class JapeApp:
         statusbar = tk.Frame(stage, bg=PAL['bg'])
         statusbar.pack(side='top', fill='x')
         self.status = tk.Label(statusbar, text='starting…', anchor='w',
-                               bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 11))
+                               bg=PAL['bg'], fg=PAL['muted'], font=self.f['ui'])
         self.status.pack(fill='x', padx=16, pady=(8, 6))
         tk.Frame(stage, bg=PAL['line'], height=1).pack(side='top', fill='x')
 
         # The proof, and (only while a disproof is open) the Kripke countermodel
         # under it, share the stage in a vertical split below the status strip.
         self.split = tk.PanedWindow(stage, orient='vertical', bg=PAL['line'], bd=0,
-                                    sashwidth=6, sashrelief='flat', showhandle=False)
+                                    sashwidth=self.px(6), sashrelief='flat', showhandle=False)
         self.split.pack(side='top', fill='both', expand=True)
         proof_frame = tk.Frame(self.split, bg=PAL['bg'])
-        self.split.add(proof_frame, stretch='always', minsize=120)
+        self.split.add(proof_frame, stretch='always', minsize=self.px(120))
         self.canvas = tk.Canvas(proof_frame, bg=PAL['bg'], highlightthickness=0)
         vs = tk.Scrollbar(proof_frame, orient='vertical', command=self.canvas.yview)
         hs = tk.Scrollbar(proof_frame, orient='horizontal', command=self.canvas.xview)
@@ -208,9 +371,9 @@ class JapeApp:
             self.canvas.bind(seq, lambda e: self._on_click(e, False, multi=True))
 
         # sidebar
-        side = tk.Frame(body, bg=PAL['bg'], width=360)
+        side = self.side = tk.Frame(body, bg=PAL['bg'], width=self._side_width())
         side.pack(side='right', fill='y'); side.pack_propagate(False)
-        tk.Label(side, text='NEW EXERCISE', font=('Helvetica', 9, 'bold'),
+        tk.Label(side, text='NEW EXERCISE', font=self.f['heading'],
                  bg=PAL['bg'], fg=PAL['muted']).pack(anchor='w', padx=14, pady=(14, 4))
         row = tk.Frame(side, bg=PAL['bg']); row.pack(fill='x', padx=14)
         self.newvar = tk.StringVar()
@@ -224,7 +387,7 @@ class JapeApp:
         tk.Button(row, text='Prove', command=self.new_exercise, bg=PAL['accent'], fg='white',
                   relief='flat', highlightbackground=PAL['accent']).pack(side='left', padx=(6, 0))
         tk.Label(side, text='Type an operator, or its escape (case-insensitive):',
-                 font=('Helvetica', 9), bg=PAL['bg'], fg=PAL['muted']).pack(anchor='w', padx=14, pady=(6, 2))
+                 font=self.f['body'], bg=PAL['bg'], fg=PAL['muted']).pack(anchor='w', padx=14, pady=(6, 2))
         ops = [('→', '\\imp'), ('∧', '\\and'), ('∨', '\\or'), ('¬', '\\not'), ('⊢', '\\vdash'),
                ('⊥', '\\bot'), ('⊤', '\\top'), ('∀', '\\forall'), ('∃', '\\exists')]
         optbl = tk.Frame(side, bg=PAL['bg']); optbl.pack(anchor='w', padx=14, pady=(0, 8))
@@ -232,14 +395,14 @@ class JapeApp:
             r, cbase = divmod(i, 3)
             tk.Label(optbl, text=sym, font=self.term_small, bg=PAL['bg'], fg=PAL['ink']
                      ).grid(row=r, column=cbase * 2, sticky='e', padx=(0, 3), pady=1)
-            tk.Label(optbl, text=esc, font=('Courier', 9), bg=PAL['bg'], fg=PAL['muted']
+            tk.Label(optbl, text=esc, font=self.f['mono'], bg=PAL['bg'], fg=PAL['muted']
                      ).grid(row=r, column=cbase * 2 + 1, sticky='w', padx=(0, 14))
 
-        self.known_lbl = tk.Label(side, text='WHAT WE KNOW', font=('Helvetica', 9, 'bold'),
+        self.known_lbl = tk.Label(side, text='WHAT WE KNOW', font=self.f['heading'],
                                   bg=PAL['bg'], fg=PAL['muted'])
         self.known = tk.Frame(side, bg=PAL['bg'])
 
-        self.ex_label = tk.Label(side, text='EXERCISES', font=('Helvetica', 9, 'bold'),
+        self.ex_label = tk.Label(side, text='EXERCISES', font=self.f['heading'],
                                  bg=PAL['bg'], fg=PAL['muted'])
         self.ex_label.pack(anchor='w', padx=14, pady=(10, 4))
         self.tabs = tk.Frame(side, bg=PAL['bg']); self.tabs.pack(fill='x', padx=14)
@@ -253,10 +416,7 @@ class JapeApp:
         esc.pack(side='right', fill='y'); self.exlist.pack(side='left', fill='both', expand=True)
         self.exlist.bind('<Double-Button-1>', self._on_exercise)
 
-        self.root.bind_all('<Control-z>', lambda e: self.undo())
-        self.root.bind_all('<Control-Z>', lambda e: self.redo())      # Ctrl+Shift+Z
-        self.root.bind_all('<Command-z>', lambda e: self.undo())
-        self.root.bind_all('<Command-Z>', lambda e: self.redo())
+        self._bind_keys()          # Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z redo, Ctrl/Cmd +/−/0 text size
 
     def _about(self):
         """A small read-only About window carrying Jape's GPL copyright and
@@ -266,10 +426,10 @@ class JapeApp:
         win.configure(bg=PAL['bg'])
         win.transient(self.root)
         win.resizable(False, False)
-        tk.Label(win, text='PyJape', font=('Helvetica', 16, 'bold'),
+        tk.Label(win, text='PyJape', font=self.f['title'],
                  bg=PAL['bg'], fg=PAL['ink']).pack(anchor='w', padx=18, pady=(16, 2))
         txt = tk.Text(win, width=64, height=20, wrap='word', relief='flat',
-                      bg=PAL['bg'], fg=PAL['ink'], font=('Helvetica', 10),
+                      bg=PAL['bg'], fg=PAL['ink'], font=self.f['body'],
                       padx=18, pady=4, cursor='arrow', highlightthickness=0)
         txt.insert('1.0', ABOUT_TEXT)
         txt.configure(state='disabled')          # read-only
@@ -534,15 +694,15 @@ class JapeApp:
         texts, lines, rects = self.state.texts, self.state.lines, self.state.rects
         self.item_pick = {}                      # canvas item id -> {x,y,cls}
         if not texts and not lines:
-            c.create_text(260, 90, text='No proof open — type a conjecture, or pick one →',
-                          fill=PAL['muted'], font=self.ui_font)
-            c.configure(scrollregion=(0, 0, 520, 180))
+            c.create_text(self.px(24), self.px(80), anchor='w', fill=PAL['muted'], font=self.ui_font,
+                          text='No proof open — type a conjecture, or pick one →')
+            c.configure(scrollregion=(0, 0, self.zpx(520), self.zpx(180)))
             return
         xs = [t['x'] for t in texts] + [l['x1'] for l in lines] + [l['x2'] for l in lines] + [r['x'] for r in rects]
         ys = [t['y'] for t in texts] + [l['y1'] for l in lines] + [l['y2'] for l in lines] + [r['y'] for r in rects]
-        pad = 24
+        pad = self.px(24)
         ox = -min(xs) + pad
-        oy = -min(ys) + pad + 20
+        oy = -min(ys) + pad + self.px(20)
         for l in lines:
             c.create_line(l['x1'] + ox, l['y1'] + oy, l['x2'] + ox, l['y2'] + oy, fill=PAL['ink'])
         for r in rects:
@@ -654,22 +814,23 @@ class JapeApp:
         self._dshown = False
         f = self.dframe = tk.Frame(self.split, bg=PAL['bg'])
         head = tk.Frame(f, bg=PAL['bg']); head.pack(side='top', fill='x', padx=16, pady=(8, 2))
-        tk.Label(head, text='COUNTERMODEL', font=('Helvetica', 9, 'bold'),
+        tk.Label(head, text='COUNTERMODEL', font=self.f['heading'],
                  bg=PAL['bg'], fg=PAL['muted']).pack(side='left')
-        tk.Label(head, text='EXPERIMENTAL', font=('Helvetica', 8, 'bold'),
+        tk.Label(head, text='EXPERIMENTAL', font=self.f['small_bold'],
                  bg=PAL['amber'], fg='white', padx=4).pack(side='left', padx=(6, 0))
         for txt, fn in (('✕ Close', self.close_disproof), ('Done', self.disproof_done),
                         ('Start again', self.restart_disproof), ('Delete world', self.delete_world),
                         ('+ World above', self.add_world)):
-            tk.Button(head, text=txt, command=fn, relief='flat', font=('Helvetica', 9),
+            tk.Button(head, text=txt, command=fn, relief='flat', font=self.f['body'],
                       bg=PAL['bg'], fg=PAL['accent'], highlightbackground=PAL['bg']
                       ).pack(side='right', padx=2)
-        self.dmsg = tk.Label(f, text='', anchor='w', justify='left', wraplength=640,
-                             bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 9))
+        f.bind('<Configure>', lambda e: self.dmsg.configure(wraplength=max(self.px(200), e.width - self.px(40))))
+        self.dmsg = tk.Label(f, text='', anchor='w', justify='left', wraplength=self.px(640),
+                             bg=PAL['bg'], fg=PAL['muted'], font=self.f['body'])
         self.dmsg.pack(side='top', fill='x', padx=16)
 
         bar = tk.Frame(f, bg=PAL['bg']); bar.pack(side='bottom', fill='x', padx=16, pady=(2, 8))
-        tk.Label(bar, text='Put on the selected world:', font=('Helvetica', 9),
+        tk.Label(bar, text='Put on the selected world:', font=self.f['body'],
                  bg=PAL['bg'], fg=PAL['muted']).pack(side='left', padx=(0, 6))
         self.tilebar = tk.Frame(bar, bg=PAL['bg']); self.tilebar.pack(side='left')
         self.labelvar = tk.StringVar()
@@ -677,9 +838,9 @@ class JapeApp:
                        bg='white', fg=PAL['ink'], relief='solid', bd=1, highlightthickness=0)
         ent.pack(side='left', padx=(10, 4))
         ent.bind('<Return>', lambda e: self.add_custom_label())
-        tk.Button(bar, text='Add', command=self.add_custom_label, relief='flat', font=('Helvetica', 9),
+        tk.Button(bar, text='Add', command=self.add_custom_label, relief='flat', font=self.f['body'],
                   bg=PAL['bg'], fg=PAL['accent'], highlightbackground=PAL['bg']).pack(side='left')
-        tk.Label(bar, text='e.g. Q, R(i,j), actual j', font=('Helvetica', 8),
+        tk.Label(bar, text='e.g. Q, R(i,j), actual j', font=self.f['small'],
                  bg=PAL['bg'], fg=PAL['muted']).pack(side='left', padx=6)
 
         box = tk.Frame(f, bg=PAL['bg']); box.pack(side='top', fill='both', expand=True)
@@ -695,7 +856,7 @@ class JapeApp:
 
     def _show_disproof_pane(self, show):
         if show and not self._dshown:
-            self.split.add(self.dframe, stretch='always', minsize=180)
+            self.split.add(self.dframe, stretch='always', minsize=self.px(180))
             self._dshown = True
             self.root.update_idletasks()
             self.split.sash_place(0, 0, int(self.split.winfo_height() * 0.45))
@@ -872,15 +1033,18 @@ class JapeApp:
                       bg='white', fg=PAL['ink'], highlightthickness=0, padx=6, pady=0,
                       command=lambda s=t: self.add_label(s)).pack(side='left', padx=2)
 
-        pad = 16
+        pad = self.px(16)
+        g = self.dpi * self.zoom                     # world drawing scale: grows with the text
         fnt = self.fonts[0]
         asc, desc = fnt.metrics('ascent'), fnt.metrics('descent')
         colour = {'on': PAL['forced'], 'off': PAL['unforced'], 'out': PAL['out'], None: PAL['ink']}
-        # -- the sequent strip, each subformula coloured by forcing at the selected world(s)
-        sx0 = pad - min((t['x'] for t in d['seq']), default=0)
+        # -- the sequent strip, each subformula coloured by forcing at the selected world(s).
+        # We place the elements ourselves, in the engine's order: it stores the
+        # strip's layout when it evaluates the model, so after a text-size change
+        # its x positions are stale. Its (x, y) stay the elements' identities.
         base = pad + asc
-        for t in d['seq']:
-            x = t['x'] + sx0
+        x = pad
+        for t in sorted(d['seq'], key=lambda t: t['x']):
             tf = self.fonts.get(t['font'], fnt)
             runs = P.forcing_runs(t['raw']) if t['font'] == 0 else [(t['text'], None)]
             x0 = x
@@ -892,23 +1056,23 @@ class JapeApp:
                     c.create_line(x0, base + desc + 2, x, base + desc + 2, fill=PAL['accent'], width=2)
                 hit = c.create_rectangle(x0, base - asc, x, base + desc, outline='', fill='')
                 self.d_pick[hit] = ('seq', (t['x'], t['y']))
-        c.create_text(pad, base + desc + 8, anchor='nw', font=self.fonts[1], fill=PAL['muted'],
+        c.create_text(pad, base + desc + self.zpx(8), anchor='nw', font=self.fonts[1], fill=PAL['muted'],
                       text='green = holds at the selected world     violet = does not hold')
 
         # -- the worlds: root at the bottom, children above (flip the engine's y)
-        R = self.WORLD_R
+        R = self.WORLD_R * g
         ws = d['worlds']
         if not ws:
             return
         minx = min(p[0] for p in ws); maxy = max(p[1] for p in ws)
-        top = base + desc + 8 + self.fonts[1].metrics('linespace') + 24
-        def pos(p):
-            return (p[0] - minx + pad + R + 4, top + (maxy - p[1]) + R)
+        top = base + desc + self.zpx(8) + self.fonts[1].metrics('linespace') + self.zpx(24)
+        def pos(p):                                  # engine coords -> canvas (y flipped, scaled)
+            return ((p[0] - minx) * g + pad + R + 4, top + (maxy - p[1]) * g + R)
         for p, wd in ws.items():
             for ch in wd['children']:
                 if ch in ws:
                     (x1, y1), (x2, y2) = pos(p), pos(ch)
-                    c.create_line(x1, y1, x2, y2, fill=PAL['ink'], width=1.5)
+                    c.create_line(x1, y1, x2, y2, fill=PAL['ink'], width=1.5 * self.dpi)
         lab_font = self.term_small
         lh = lab_font.metrics('linespace')
         for p, wd in ws.items():
@@ -918,13 +1082,14 @@ class JapeApp:
             if self.dsel:
                 fill = PAL['forcedbg'] if wd['forced'] else PAL['unforcedbg']
             oval = c.create_oval(x - R, y - R, x + R, y + R, fill=fill,
-                                 outline=PAL['accent'] if chosen else PAL['ink'], width=3 if chosen else 1.5)
+                                 outline=PAL['accent'] if chosen else PAL['ink'],
+                                 width=(3 if chosen else 1.5) * self.dpi)
             self.d_pick[oval] = ('world', p)
             for i, (_, text) in enumerate(wd['labels']):
-                tx, ty = x + R + 6, y - (len(wd['labels']) * lh) / 2 + i * lh
+                tx, ty = x + R + self.px(6), y - (len(wd['labels']) * lh) / 2 + i * lh
                 item = c.create_text(tx, ty, text=text, anchor='nw', font=lab_font, fill=PAL['ink'])
                 self.d_pick[item] = ('world', p)
-                bx = c.bbox(item)[2] + 8
+                bx = c.bbox(item)[2] + self.px(8)
                 xi = c.create_text(bx, ty + 2, text='×', anchor='nw', font=self.fonts[1], fill=PAL['muted'])
                 self.d_pick[xi] = ('unlabel', (p, text))
         bbox = c.bbox('all')
@@ -970,7 +1135,7 @@ class JapeApp:
             w.destroy()
         for n in names:
             b = tk.Button(self.tabs, text=re.sub(r' conjectures$', '', n, flags=re.I),
-                          relief='flat', font=('Helvetica', 9),
+                          relief='flat', font=self.f['body'],
                           bg=(PAL['accent'] if n == self.active_panel else PAL['bg']),
                           fg=('white' if n == self.active_panel else PAL['muted']),
                           command=lambda nm=n: self._switch_panel(nm))
@@ -1025,22 +1190,22 @@ class JapeApp:
             assumed = [s for s in facts if s.replace(' ', '') not in premises]
             cap = 'proving %s' % gtext + (' — assuming %s' % ', '.join(assumed) if assumed else '')
             hdr = tk.Frame(self.known, bg=PAL['bg']); hdr.pack(anchor='w', fill='x', pady=(0, 2))
-            tk.Label(hdr, text=cap, bg=PAL['bg'], fg=PAL['ink'], font=('Helvetica', 9, 'bold'),
-                     wraplength=250, justify='left').pack(side='left')
+            tk.Label(hdr, text=cap, bg=PAL['bg'], fg=PAL['ink'], font=self.f['heading'],
+                     wraplength=self._wrap() - self.px(80), justify='left').pack(side='left')
             tk.Label(hdr, text='case %d of %d' % (gi, gtot), bg=PAL['bg'], fg=PAL['accent'],
-                     font=('Helvetica', 8)).pack(side='right')
+                     font=self.f['small']).pack(side='right')
             tk.Label(self.known, text='Click another goal to switch cases.',
-                     bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 8)).pack(anchor='w', pady=(0, 3))
+                     bg=PAL['bg'], fg=PAL['muted'], font=self.f['small']).pack(anchor='w', pady=(0, 3))
 
         if not facts:
             tk.Label(self.known, text='Nothing known yet — make an assumption or forward step.',
-                     bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 9), wraplength=330,
+                     bg=PAL['bg'], fg=PAL['muted'], font=self.f['body'], wraplength=self._wrap(),
                      justify='left').pack(anchor='w')
         for s in facts:
             r = tk.Frame(self.known, bg=PAL['bg']); r.pack(anchor='w', fill='x')
             tk.Label(r, text=s, bg=PAL['bg'], fg=PAL['ink'], font=self.term_small).pack(side='left')
             tag = 'premise' if s.replace(' ', '') in premises else 'assumed / derived'
-            tk.Label(r, text=tag, bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 8)).pack(side='left', padx=6)
+            tk.Label(r, text=tag, bg=PAL['bg'], fg=PAL['muted'], font=self.f['small']).pack(side='left', padx=6)
 
         # --- truth table: a toggle, capped to keep it light -------------------
         SAFE, HARD = 6, 10               # auto-show up to 2^6=64 rows; opt-in up to 2^10
@@ -1052,7 +1217,7 @@ class JapeApp:
         tk.Checkbutton(self.known, text='Show truth table', variable=self.show_table,
                        command=self._known_panel, bg=PAL['bg'], fg=PAL['muted'],
                        activebackground=PAL['bg'], activeforeground=PAL['ink'],
-                       selectcolor='white', font=('Helvetica', 9),
+                       selectcolor='white', font=self.f['body'],
                        highlightthickness=0, bd=0, anchor='w').pack(anchor='w', pady=(6, 0))
         if not self.show_table.get():
             return
@@ -1068,16 +1233,16 @@ class JapeApp:
 
         if nvar == 0:
             tk.Label(self.known, text='Truth tables apply to propositional logic; use the facts above.',
-                     bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 9), wraplength=330,
+                     bg=PAL['bg'], fg=PAL['muted'], font=self.f['body'], wraplength=self._wrap(),
                      justify='left').pack(anchor='w', pady=(4, 0))
             return
         if nvar > HARD or (nvar > SAFE and not self.force_big):
             box = tk.Frame(self.known, bg=PAL['bg']); box.pack(anchor='w', fill='x', pady=(2, 0))
             tk.Label(box, text='%d variables (%d rows) — table hidden to keep things fast.'
-                     % (nvar, 2 ** nvar), bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 9),
-                     wraplength=330, justify='left').pack(anchor='w')
+                     % (nvar, 2 ** nvar), bg=PAL['bg'], fg=PAL['muted'], font=self.f['body'],
+                     wraplength=self._wrap(), justify='left').pack(anchor='w')
             if nvar <= HARD:
-                tk.Button(box, text='Compute anyway', font=('Helvetica', 8), relief='flat',
+                tk.Button(box, text='Compute anyway', font=self.f['small'], relief='flat',
                           bg=PAL['bg'], fg=PAL['accent'], highlightbackground=PAL['bg'],
                           command=self._force_table).pack(anchor='w')
             return
@@ -1096,8 +1261,8 @@ class JapeApp:
                 msg = 'A world fits where %s is false (%s).' % (tbl.goal[0], vals)
             else:
                 msg = 'Some table rows make %s false, but quantified facts may rule those out.' % tbl.goal[0]
-            tk.Label(self.known, text=msg, bg=PAL['bg'], fg=PAL['ink'], font=('Helvetica', 9),
-                     wraplength=330, justify='left').pack(anchor='w', pady=(4, 6))
+            tk.Label(self.known, text=msg, bg=PAL['bg'], fg=PAL['ink'], font=self.f['body'],
+                     wraplength=self._wrap(), justify='left').pack(anchor='w', pady=(4, 6))
 
     _FORCING = [
         ('A world', 'a state of knowledge. Lines go up to the worlds it can still grow into.'),
@@ -1115,8 +1280,9 @@ class JapeApp:
             r = tk.Frame(self.known, bg=PAL['bg']); r.pack(anchor='w', fill='x', pady=1)
             tk.Label(r, text=head, bg=PAL['bg'], fg=PAL['ink'], font=self.term_small, width=9,
                      anchor='nw', justify='left').pack(side='left', anchor='n')
-            tk.Label(r, text=text, bg=PAL['bg'], fg=PAL['muted'], font=('Helvetica', 9),
-                     wraplength=250, justify='left', anchor='w').pack(side='left', fill='x')
+            tk.Label(r, text=text, bg=PAL['bg'], fg=PAL['muted'], font=self.f['body'],
+                     wraplength=self._wrap() - self.term_small.measure('0' * 9) - self.px(8),
+                     justify='left', anchor='w').pack(side='left', fill='x')
 
     def _force_table(self):
         """Opt in to computing a larger (7–10 variable) table for this proof."""
@@ -1131,7 +1297,7 @@ class JapeApp:
         cols = list(tbl.atoms) + [tbl.prop_facts[i][0] for i in fcols] + ([tbl.goal[0]] if tbl.goal else [])
         for ci, name in enumerate(cols):
             tk.Label(grid, text=name, bg=PAL['bg'], fg=PAL['muted'],
-                     font=('Helvetica', 9, 'bold')).grid(row=0, column=ci, padx=3)
+                     font=self.f['heading']).grid(row=0, column=ci, padx=3)
         for ri, row in enumerate(tbl.rows, start=1):
             fit = row['consistent']
             rbg = PAL['okbg'] if fit else PAL['bg']
@@ -1139,16 +1305,16 @@ class JapeApp:
             ci = 0
             for a in tbl.atoms:
                 tk.Label(grid, text='T' if row['v'][a] else 'F', bg=rbg, fg=fg,
-                         font=('Helvetica', 9)).grid(row=ri, column=ci, sticky='nsew', padx=1); ci += 1
+                         font=self.f['body']).grid(row=ri, column=ci, sticky='nsew', padx=1); ci += 1
             for i in fcols:
                 val = row['fact_vals'][i]
                 tk.Label(grid, text='✓' if val else '✗', bg=rbg,
                          fg=(PAL['ok'] if val else PAL['out']),
-                         font=('Helvetica', 9)).grid(row=ri, column=ci, sticky='nsew', padx=1); ci += 1
+                         font=self.f['body']).grid(row=ri, column=ci, sticky='nsew', padx=1); ci += 1
             if tbl.goal:
                 gv = ('T' if row['goal_val'] else 'F') if fit else '·'
                 tk.Label(grid, text=gv, bg=rbg, fg=(PAL['ok'] if (fit and row['goal_val']) else fg),
-                         font=('Helvetica', 9, 'bold')).grid(row=ri, column=ci, sticky='nsew', padx=1)
+                         font=self.f['heading']).grid(row=ri, column=ci, sticky='nsew', padx=1)
 
     # ---- misc ------------------------------------------------------------
     def _live_escape(self, *_):
@@ -1168,6 +1334,7 @@ class JapeApp:
 
 def main():
     engine_path, entry = E.default_paths()
+    _enable_dpi_awareness()          # before Tk exists, or Windows blurs the text
     root = tk.Tk()
     JapeApp(root, engine_path, entry)
     root.mainloop()
